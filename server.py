@@ -37,7 +37,7 @@ ACCESS_LEVELS = ("user", "trusted", "council", "leader", "admin")
 VALID_ROLES = set(ACCESS_LEVELS)
 ACCESS_RANK = {level: index for index, level in enumerate(ACCESS_LEVELS)}
 VISIBILITY_EDITOR_LEVELS = {"gps": "trusted", "cluster": "council", "region": "council"}
-REGION_DISTANCE_METERS = 2_000_000
+REGION_DISTANCE_METERS = 1_000_000
 SESSION_DURATION = timedelta(days=7)
 
 
