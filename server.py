@@ -277,7 +277,11 @@ def load_data(user):
         ACTIVE_CONFIG = db_config()
     with pymysql.connect(**ACTIVE_CONFIG, autocommit=True, cursorclass=pymysql.cursors.DictCursor) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name, x, y, z, ore_type, description, cluster_id, report_count, location_type FROM entries ORDER BY id")
+            cur.execute("SHOW COLUMNS FROM entries")
+            entry_columns = {row["Field"] for row in cur.fetchall()}
+            timestamp_column = next((name for name in ("created_at", "added_at", "created") if name in entry_columns), None)
+            timestamp_select = f", `{timestamp_column}` AS created_at" if timestamp_column else ", NULL AS created_at"
+            cur.execute("SELECT id, name, x, y, z, ore_type, description, cluster_id, report_count, location_type" + timestamp_select + " FROM entries ORDER BY id")
             entries = list(cur.fetchall())
             cur.execute("SELECT id, name, center_x, center_y, center_z FROM clusters ORDER BY id")
             clusters = list(cur.fetchall())
@@ -290,6 +294,7 @@ def load_data(user):
         entry["description"] = entry.get("description") or ""
         entry["ore_type"] = entry.get("ore_type") or "Unknown"
         entry["location_type"] = entry.get("location_type") or ""
+        entry["created_at"] = str(entry.get("created_at") or "")
         cluster = cluster_by_id.get(entry.get("cluster_id"))
         entry["cluster_name"] = cluster["name"] if cluster else "Unassigned"
         region_key = cluster_regions.get(entry.get("cluster_id"), "")
