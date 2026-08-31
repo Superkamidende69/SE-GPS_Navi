@@ -13,7 +13,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     import pymysql
@@ -39,6 +39,7 @@ ACCESS_RANK = {level: index for index, level in enumerate(ACCESS_LEVELS)}
 VISIBILITY_EDITOR_LEVELS = {"gps": "trusted", "cluster": "council", "region": "council"}
 REGION_DISTANCE_METERS = 1_000_000
 SESSION_DURATION = timedelta(days=7)
+ENTRY_COLUMNS = None
 
 
 def now():
@@ -102,6 +103,26 @@ def access_connection():
             PRIMARY KEY(entity_type, entity_key)
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_preferences (
+            user_id INTEGER PRIMARY KEY,
+            preferences_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS shared_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL CHECK(entity_type IN ('gps', 'cluster', 'region')),
+            entity_key TEXT NOT NULL,
+            author_user_id INTEGER NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(author_user_id) REFERENCES users(id) ON DELETE CASCADE
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS shared_notes_entity_idx ON shared_notes(entity_type, entity_key, id DESC)")
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
     if "access_level" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN access_level TEXT NOT NULL DEFAULT 'user'")
@@ -241,6 +262,75 @@ def public_user(row):
     }
 
 
+def preferences_for_user(user_id):
+    with access_connection() as conn:
+        row = conn.execute("SELECT preferences_json, updated_at FROM user_preferences WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        return {}, None, False
+    try:
+        preferences = json.loads(row["preferences_json"])
+    except (TypeError, json.JSONDecodeError):
+        preferences = {}
+    return preferences if isinstance(preferences, dict) else {}, row["updated_at"], True
+
+
+def save_preferences(user_id, preferences):
+    if not isinstance(preferences, dict):
+        raise ValueError("Preferences must be an object")
+    encoded = json.dumps(preferences, separators=(",", ":"), ensure_ascii=False)
+    if len(encoded.encode("utf-8")) > 250_000:
+        raise ValueError("Preferences are too large to save")
+    updated_at = now_text()
+    with access_connection() as conn:
+        conn.execute(
+            """INSERT INTO user_preferences (user_id, preferences_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 preferences_json=excluded.preferences_json, updated_at=excluded.updated_at""",
+            (user_id, encoded, updated_at),
+        )
+    return updated_at
+
+
+def note_entity_access(user, entity_type, entity_key):
+    entity_key = visibility_key(entity_type, entity_key)
+    visibility = saved_visibility().get((entity_type, entity_key), "user")
+    if access_rank(user["role"]) < access_rank(visibility):
+        raise PermissionError("You do not have access to notes for this map item")
+    return entity_key
+
+
+def shared_notes_for(user, entity_type, entity_key):
+    entity_key = note_entity_access(user, entity_type, entity_key)
+    with access_connection() as conn:
+        rows = conn.execute(
+            """SELECT n.id, n.body, n.created_at, u.display_name AS author_name
+               FROM shared_notes n JOIN users u ON u.id=n.author_user_id
+               WHERE n.entity_type=? AND n.entity_key=?
+               ORDER BY n.id DESC LIMIT 50""",
+            (entity_type, entity_key),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def add_shared_note(user, entity_type, entity_key, body):
+    if access_rank(user["role"]) < access_rank("trusted"):
+        raise PermissionError("Trusted access is required to add shared notes")
+    entity_key = note_entity_access(user, entity_type, entity_key)
+    text = str(body or "").strip()
+    if not text:
+        raise ValueError("A note cannot be empty")
+    if len(text) > 1000:
+        raise ValueError("Notes must be 1,000 characters or fewer")
+    created_at = now_text()
+    with access_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO shared_notes (entity_type, entity_key, author_user_id, body, created_at) VALUES (?, ?, ?, ?, ?)",
+            (entity_type, entity_key, user["id"], text, created_at),
+        )
+    return {"id": cur.lastrowid, "body": text, "created_at": created_at, "author_name": user["display_name"]}
+
+
 def user_count():
     with access_connection() as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -271,15 +361,59 @@ def token_user(headers):
     return public_user(row) if row else None
 
 
+def entry_schema(cursor):
+    """Cache the entries schema so periodic sync checks skip SHOW COLUMNS."""
+    global ENTRY_COLUMNS
+    if ENTRY_COLUMNS is None:
+        cursor.execute("SHOW COLUMNS FROM entries")
+        ENTRY_COLUMNS = {row["Field"] for row in cursor.fetchall()}
+    timestamp_column = next((name for name in ("created_at", "added_at", "created") if name in ENTRY_COLUMNS), None)
+    return ENTRY_COLUMNS, timestamp_column
+
+
+def database_revision(user):
+    """Return a compact signature of map data visible to this access level."""
+    global ACTIVE_CONFIG
+    if ACTIVE_CONFIG is None:
+        ACTIVE_CONFIG = db_config()
+    with pymysql.connect(**ACTIVE_CONFIG, autocommit=True, cursorclass=pymysql.cursors.DictCursor) as conn:
+        with conn.cursor() as cur:
+            _, timestamp_column = entry_schema(cur)
+            entry_signature = "CONCAT_WS('|', id, name, x, y, z, ore_type, description, cluster_id, report_count, location_type"
+            if timestamp_column:
+                entry_signature += f", `{timestamp_column}`"
+            entry_signature += ")"
+            cur.execute(
+                "SELECT COUNT(*) AS row_count, COALESCE(MAX(id), 0) AS max_id, "
+                f"COALESCE(SUM(CRC32({entry_signature})), 0) AS checksum FROM entries"
+            )
+            entries = cur.fetchone()
+            cluster_signature = "CONCAT_WS('|', id, name, center_x, center_y, center_z)"
+            cur.execute(
+                "SELECT COUNT(*) AS row_count, COALESCE(MAX(id), 0) AS max_id, "
+                f"COALESCE(SUM(CRC32({cluster_signature})), 0) AS checksum FROM clusters"
+            )
+            clusters = cur.fetchone()
+    with access_connection() as conn:
+        visibility = conn.execute(
+            "SELECT COUNT(*) AS row_count, COALESCE(MAX(updated_at), '') AS latest FROM entity_visibility"
+        ).fetchone()
+    payload = {
+        "role": user["role"],
+        "entries": dict(entries),
+        "clusters": dict(clusters),
+        "visibility": dict(visibility),
+    }
+    return hashlib.sha256(json.dumps(payload, default=str, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+
+
 def load_data(user):
     global ACTIVE_CONFIG
     if ACTIVE_CONFIG is None:
         ACTIVE_CONFIG = db_config()
     with pymysql.connect(**ACTIVE_CONFIG, autocommit=True, cursorclass=pymysql.cursors.DictCursor) as conn:
         with conn.cursor() as cur:
-            cur.execute("SHOW COLUMNS FROM entries")
-            entry_columns = {row["Field"] for row in cur.fetchall()}
-            timestamp_column = next((name for name in ("created_at", "added_at", "created") if name in entry_columns), None)
+            _, timestamp_column = entry_schema(cur)
             timestamp_select = f", `{timestamp_column}` AS created_at" if timestamp_column else ", NULL AS created_at"
             cur.execute("SELECT id, name, x, y, z, ore_type, description, cluster_id, report_count, location_type" + timestamp_select + " FROM entries ORDER BY id")
             entries = list(cur.fetchall())
@@ -346,7 +480,8 @@ class Handler(SimpleHTTPRequestHandler):
         return user
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        request_url = urlparse(self.path)
+        path = request_url.path
         if path == "/api/auth/session":
             user = token_user(self.headers)
             self.send_json({"setup_required": user_count() == 0, "user": user}, 200 if user or user_count() == 0 else 401)
@@ -357,6 +492,35 @@ class Handler(SimpleHTTPRequestHandler):
             with access_connection() as conn:
                 users = [public_user(row) for row in conn.execute("SELECT * FROM users ORDER BY is_active DESC, display_name COLLATE NOCASE, username COLLATE NOCASE")]
             self.send_json({"users": users})
+            return
+        if path == "/api/preferences":
+            user = self.require_user()
+            if not user:
+                return
+            preferences, updated_at, has_preferences = preferences_for_user(user["id"])
+            self.send_json({"preferences": preferences, "updated_at": updated_at, "has_preferences": has_preferences})
+            return
+        if path == "/api/notes":
+            user = self.require_user()
+            if not user:
+                return
+            try:
+                query = parse_qs(request_url.query)
+                notes = shared_notes_for(user, str(query.get("entity_type", [""])[0]), query.get("entity_key", [""])[0])
+                self.send_json({"notes": notes})
+            except PermissionError as exc:
+                self.send_json({"error": str(exc)}, 403)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 400)
+            return
+        if path == "/api/data/revision":
+            user = self.require_user()
+            if not user:
+                return
+            try:
+                self.send_json({"revision": database_revision(user)})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 503)
             return
         if path == "/api/data":
             user = self.require_user()
@@ -424,6 +588,20 @@ class Handler(SimpleHTTPRequestHandler):
                     )
                     row = conn.execute("SELECT * FROM users WHERE id=?", (cur.lastrowid,)).fetchone()
                 self.send_json({"ok": True, "user": public_user(row)}, 201)
+                return
+            if path == "/api/preferences":
+                user = self.require_user()
+                if not user:
+                    return
+                updated_at = save_preferences(user["id"], incoming.get("preferences"))
+                self.send_json({"ok": True, "updated_at": updated_at})
+                return
+            if path == "/api/notes":
+                user = self.require_user()
+                if not user:
+                    return
+                note = add_shared_note(user, str(incoming.get("entity_type", "")), incoming.get("entity_key"), incoming.get("body"))
+                self.send_json({"ok": True, "note": note}, 201)
                 return
             if path == "/api/visibility":
                 actor = self.require_user()

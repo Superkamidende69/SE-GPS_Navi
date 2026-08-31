@@ -50,6 +50,7 @@ Credentials entered in the connection window are used for the active local serve
 - 3D map projection with mouse rotation, middle-mouse panning, wheel zoom, reset/centre controls, and a Blender-style view cube.
 - Rotating deep-space skybox with nebula haze, dust, and layered stars.
 - Optional map layers for the skybox, grid planes, regions, clusters, GPS signals, and your temporary location.
+- Account-synced route hazard volumes for danger, pirate patrols, gravity wells, no-fly zones, and cautions. Add a GPS centre and radius, then toggle them with the **Route hazards** map layer.
 - Hover cards for regions, clusters, and individual GPS markers.
 - Click through the hierarchy: **region → cluster → GPS**. Use the back control to return to the wider map.
 - Main-map switch between regional grouping and an all-clusters view.
@@ -61,19 +62,22 @@ Credentials entered in the connection window are used for the active local serve
 - Region editing supports name, description, color, point symbol, visibility, owner/faction, and ownership status.
 - Cluster editing supports name, description, color, point symbol, and visibility.
 - Region and cluster descriptions can show a resource summary based on asteroid GPS entries.
+- Selected regions include a statistics panel for clusters, GPS signals, asteroid signals, distinct resources, mapped span, and the newest timestamped GPS entry.
+- Shared notes are available on regions, clusters, and individual GPS points. Everyone permitted to view an item can read its notes; **Trusted** users and above can add timestamped notes under their Atlas identity.
 
-Region and cluster presentation details—such as names, descriptions, colors, symbols, and ownership—are stored locally in the browser. Visibility rules are stored by the local Atlas server. Neither rewrites the MySQL GPS tables.
+Region and cluster presentation details—such as names, descriptions, colors, symbols, and ownership—are saved with the signed-in Atlas account on the local server. They follow that account between browsers connected to the same Atlas server. Visibility rules are also stored by the local Atlas server. Neither rewrites the MySQL GPS tables.
 
 ### GPS atlas
 
 - Search and filter GPS points by **All**, **Asteroid**, **Station**, **Planet**, **Base**, **Unknown** (including Strong), and **Other**.
 - Add a local temporary GPS by pasting a Space Engineers GPS string, choosing its type, and adding a description. New local GPS points receive an added timestamp; they are not saved to MySQL.
-- Edit imported GPS name, coordinates, type, description, color, symbol, and visibility. When MySQL is connected, coordinate/type/description edits are written back to MySQL; color/symbol settings remain browser-local and visibility stays in Atlas access data.
+- Edit imported GPS name, coordinates, type, description, color, symbol, and visibility. When MySQL is connected, coordinate/type/description edits are written back to MySQL; color/symbol settings follow the signed-in Atlas account and visibility stays in Atlas access data.
 - Copy a selected GPS to the clipboard.
 - Remove a GPS marker from the current map session. Imported MySQL records return after the next sync or page reload unless deleted from the source database.
 - Measure the straight-line distance between two GPS points in kilometres.
-- Add GPS points to a browser-local favorites list.
-- Auto-group coded ore GPS names such as `P3X-664 Ice` and `P3X-664 Fe`, using the first GPS position for the combined marker.
+- Add GPS points to an account-synced favorites list.
+- Auto-group coded ore GPS names such as `P3X-664 Ice` and `P3X-664 Fe` only when they are within 1 km of the first GPS position; distant signals remain separate.
+- Resource Finder lists every imported asteroid resource, filters the atlas to that material, and focuses the nearest matching GPS once a temporary current location is set. The regular search also recognizes common ore names and symbols, such as `iron` / `Fe`, `nickel` / `Ni`, and `uranium` / `U`.
 
 ### Position, scanner, and alerts
 
@@ -87,6 +91,7 @@ Region and cluster presentation details—such as names, descriptions, colors, s
 - Change Activity panel identifies GPS and cluster additions, updates, and removals detected during MySQL sync.
 - Region, cluster, and GPS visibility can be limited by access level.
 - Built-in user management for administrators.
+- Account preferences, including favorites, labels, colors, symbols, map layers, route hazards, scanner settings, alerts, and auto-grouping, are saved to the local server so they load in another browser signed in to the same account.
 
 Access levels:
 
