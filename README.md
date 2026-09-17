@@ -28,6 +28,19 @@ To stop the atlas, close the server window or press `Ctrl+C` in it.
 
 ## Connect MySQL
 
+### Open the atlas from another LAN device
+
+Keep the server running on this PC, then open `http://<PC-LAN-IP>:8765/`
+on a phone or computer connected to the same network. Sign in with an Atlas
+account. API requests use the address of the page, so they work from other devices.
+Allow inbound TCP port 8765 through Windows Firewall for your local subnet only;
+no router port forwarding is needed. Guest Wi-Fi may isolate devices.
+
+The server listens on all IPv4 interfaces by default. Set `SE_ATLAS_HOST` to
+`127.0.0.1` before starting it to return to access from this PC only, or to a
+specific LAN address to restrict the listening interface. `SE_ATLAS_PORT` changes
+the port (default 8765).
+
 After signing in as a **Leader** or **Admin**, select **Connect MySQL** in the top bar. Enter the database host/IP, port, username, password, and database name.
 
 The map expects the existing Navigator tables:
@@ -48,7 +61,7 @@ Credentials entered in the connection window are used for the active local serve
 ### 3D spatial map
 
 - 3D map projection with mouse rotation, middle-mouse panning, wheel zoom, reset/centre controls, and a Blender-style view cube.
-- Rotating deep-space skybox with nebula haze, dust, and layered stars.
+- Rotating NASA/Tycho star skybox using the same local cube textures as the default Cesium sky in God’s Eye View. Distant stars rotate with the camera and stay fixed during pan/zoom; a faint tiled reference plane and depth-faded intersections help show map orientation. The Stars and Grid planes controls toggle these layers independently.
 - Optional map layers for the skybox, grid planes, regions, clusters, GPS signals, and your temporary location.
 - Account-synced route hazard volumes for danger, pirate patrols, gravity wells, no-fly zones, and cautions. Add a GPS centre and radius, then toggle them with the **Route hazards** map layer.
 - Hover cards for regions, clusters, and individual GPS markers.
@@ -102,6 +115,20 @@ Access levels:
 - **Admin** — manage users and permissions.
 
 ## Map controls
+
+The workspace has three panel controls: **Atlas**, **Map**, and **Inspector**.
+On desktop, Atlas and Inspector toggle the side panels; Map expands the map and
+restores the panels on a second click. On smaller screens, these controls switch
+between full-width views. Your position, nearby scanner, and activity are in the
+Inspector. Resource Finder, regions/sectors, and favorites expand in the Atlas.
+
+Press `/` to open and focus location search. Dialogs keep keyboard focus inside
+the form; `Escape` closes dismissible dialogs. The sign-in dialog stays open until
+authentication succeeds. Telemetry reports the actual bridge connection state.
+
+The interface theme lives in `overhaul.css`, loaded after the original feature
+styles. `interface.js` handles panel layout and keyboard behavior; the map engine
+and account permission logic remain in `app.js` and `access.js`.
 
 | Action | Control |
 | --- | --- |
