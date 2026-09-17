@@ -7,9 +7,13 @@ import base64
 import hashlib
 import json
 import os
+import math
+import random
 import re
 import secrets
 import sqlite3
+import threading
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +26,7 @@ except ImportError as exc:
     raise SystemExit("Install the database driver first: pip install pymysql") from exc
 
 PORT = int(os.environ.get("SE_ATLAS_PORT", "8765"))
+HOST = os.environ.get("SE_ATLAS_HOST", "0.0.0.0")
 ACTIVE_CONFIG = None
 CONFIG_FILE = Path.home() / ".se_gps_navigator" / "db_config.json"
 ACCESS_DB = Path(os.environ.get("SE_ATLAS_ACCESS_DB", Path.home() / ".se_gps_navigator" / "atlas_access.sqlite3"))
@@ -40,6 +45,17 @@ VISIBILITY_EDITOR_LEVELS = {"gps": "trusted", "cluster": "council", "region": "c
 REGION_DISTANCE_METERS = 1_000_000
 SESSION_DURATION = timedelta(days=7)
 ENTRY_COLUMNS = None
+REGION_IDENTITY_LOCK = threading.Lock()
+CLUSTER_RADIUS = 100_000
+DEDUP_RADIUS = 1_500
+STARGATE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+STARGATE_DIGITS = "0123456789"
+ORE_ALIASES = {
+    "fe": ("fe", "iron"), "ni": ("ni", "nickel"), "co": ("co", "cobalt"),
+    "si": ("si", "silicon"), "mg": ("mg", "magnesium"), "ag": ("ag", "silver"),
+    "au": ("au", "gold"), "pt": ("pt", "platinum"), "u": ("u", "uranium"),
+    "ice": ("ice",), "stone": ("stone",),
+}
 
 
 def now():
@@ -212,8 +228,19 @@ def saved_visibility():
 
 
 def region_keys(clusters):
+    with REGION_IDENTITY_LOCK:
+        return persistent_region_keys(clusters)
+
+
+def persistent_region_keys(clusters):
+    # Keep identities across renames and changes in region membership.
+    # Existing region keys are retained so saved preferences/notes remain valid.
+    with closing(access_connection()) as conn, conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS atlas_cluster_identity (id INTEGER PRIMARY KEY, name TEXT NOT NULL, region_key TEXT NOT NULL)")
+        previous = {row['id']: dict(row) for row in conn.execute('SELECT * FROM atlas_cluster_identity')}
     remaining = set(range(len(clusters)))
     keys = {}
+    used_keys = set()
     while remaining:
         seed = next(iter(remaining))
         queue = [seed]
@@ -229,9 +256,45 @@ def region_keys(clusters):
                 if distance <= REGION_DISTANCE_METERS:
                     remaining.remove(candidate)
                     queue.append(candidate)
-        key = json.dumps(sorted(str(clusters[index]["name"]) for index in members), separators=(",", ":"))
+        votes = {}
+        for index in members:
+            old = previous.get(clusters[index]['id'])
+            if old and old['region_key'] not in used_keys:
+                votes[old['region_key']] = votes.get(old['region_key'], 0) + 1
+        key = min(votes, key=lambda value: (-votes[value], value)) if votes else json.dumps(sorted(str(clusters[index]["name"]) for index in members), separators=(",", ":"))
+        if key in used_keys:
+            key = 'region:' + secrets.token_hex(12)
+        used_keys.add(key)
         for index in members:
             keys[clusters[index]["id"]] = key
+    with closing(access_connection()) as conn, conn:
+        for row in conn.execute('SELECT user_id, preferences_json FROM user_preferences').fetchall():
+            try:
+                preferences = json.loads(row['preferences_json'])
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(preferences, dict):
+                continue
+            settings = preferences.get('cluster_settings', {})
+            if not isinstance(settings, dict):
+                continue
+            changed = False
+            for cluster in clusters:
+                stable_key = 'cluster:' + str(cluster['id'])
+                old = previous.get(cluster['id'])
+                legacy = settings.get(old['name']) if old else None
+                legacy = legacy or settings.get(cluster['name'])
+                if stable_key not in settings and legacy:
+                    settings[stable_key] = legacy
+                    changed = True
+            if changed:
+                conn.execute('UPDATE user_preferences SET preferences_json=? WHERE user_id=?', (json.dumps(preferences), row['user_id']))
+        for cluster in clusters:
+            old = previous.get(cluster['id'])
+            if old and old['name'] != cluster['name']:
+                conn.execute("UPDATE OR IGNORE entity_visibility SET entity_key=? WHERE entity_type='cluster' AND entity_key=?", (cluster['name'], old['name']))
+                conn.execute("UPDATE shared_notes SET entity_key=? WHERE entity_type='cluster' AND entity_key=?", (cluster['name'], old['name']))
+            conn.execute('INSERT OR REPLACE INTO atlas_cluster_identity (id, name, region_key) VALUES (?, ?, ?)', (cluster['id'], cluster['name'], keys[cluster['id']]))
     return keys
 
 
@@ -371,6 +434,181 @@ def entry_schema(cursor):
     return ENTRY_COLUMNS, timestamp_column
 
 
+def parse_se_gps(text):
+    """Parse the GPS format accepted by Space Engineers and Navigator."""
+    parts = str(text or "").strip().split(":")
+    if len(parts) < 5 or parts[0].upper() != "GPS" or not parts[1].strip():
+        raise ValueError("GPS format not recognized. Use GPS:Name:X:Y:Z:")
+    try:
+        x, y, z = (float(parts[index]) for index in (2, 3, 4))
+    except ValueError as exc:
+        raise ValueError("GPS coordinates must be numbers") from exc
+    if not all(math.isfinite(value) for value in (x, y, z)):
+        raise ValueError("GPS coordinates must be finite numbers")
+    return {"name": parts[1].strip(), "x": x, "y": y, "z": z, "description": ":".join(parts[6:]).rstrip(":")}
+
+
+def distance_3d(left, right):
+    return math.sqrt(sum((left[key] - right[key]) ** 2 for key in ("x", "y", "z")))
+
+
+def detected_ore(text):
+    text = str(text or "").lower()
+    for ore, aliases in ORE_ALIASES.items():
+        if any(re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", text) for alias in aliases):
+            return ore.upper()
+    return "UNKNOWN"
+
+
+def cluster_name_in_text(clusters, text):
+    for cluster in clusters:
+        name = cluster["name"]
+        if re.search(r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])", text, re.IGNORECASE):
+            return cluster
+    return None
+
+
+def generate_cluster_name(clusters, existing_names, position):
+    """Use the Navigator's nearby-prefix Stargate naming convention."""
+    prefix, distance_km = None, None
+    nearby = []
+    for cluster in clusters:
+        match = re.match(r"^([A-Z]\d[A-Z])-\d+$", cluster["name"])
+        if match:
+            distance = distance_3d(position, {"x": cluster["center_x"], "y": cluster["center_y"], "z": cluster["center_z"]})
+            if distance <= CLUSTER_RADIUS:
+                nearby.append((distance, match.group(1)))
+    if nearby:
+        distance, prefix = min(nearby)
+        distance_km = min(999, int(distance // 1000))
+    for _ in range(10_000):
+        candidate_prefix = prefix or (random.choice(STARGATE_LETTERS) + random.choice(STARGATE_DIGITS) + random.choice(STARGATE_LETTERS))
+        suffix = distance_km if distance_km is not None else random.randint(0, 999)
+        name = f"{candidate_prefix}-{suffix:03d}"
+        if name not in existing_names:
+            return name
+    raise RuntimeError("Could not generate a unique Navigator cluster name")
+
+
+def ensure_navigator_schema(cursor):
+    """Keep Atlas writes compatible with Navigator databases from older versions."""
+    cursor.execute("SHOW COLUMNS FROM clusters LIKE 'marker_entry_id'")
+    if not cursor.fetchone():
+        cursor.execute("ALTER TABLE clusters ADD COLUMN marker_entry_id INT NULL")
+
+
+def create_cluster_marker(cursor, cluster):
+    cursor.execute(
+        "INSERT INTO entries (name, x, y, z, ore_type, description, added_at, cluster_id, location_type) VALUES (%s,%s,%s,%s,'CLUSTER',%s,NOW(),%s,'Cluster Center')",
+        (cluster["name"], cluster["center_x"], cluster["center_y"], cluster["center_z"], "Auto-generated cluster center marker", cluster["id"]),
+    )
+    cluster["marker_entry_id"] = cursor.lastrowid
+    cursor.execute("UPDATE clusters SET marker_entry_id=%s WHERE id=%s", (cluster["marker_entry_id"], cluster["id"]))
+
+
+def refresh_cluster_center(cursor, cluster):
+    cursor.execute("SELECT AVG(x) AS x, AVG(y) AS y, AVG(z) AS z FROM cluster_points WHERE cluster_id=%s", (cluster["id"],))
+    center = cursor.fetchone()
+    cluster["center_x"], cluster["center_y"], cluster["center_z"] = center["x"], center["y"], center["z"]
+    cursor.execute("UPDATE clusters SET center_x=%s, center_y=%s, center_z=%s WHERE id=%s", (cluster["center_x"], cluster["center_y"], cluster["center_z"], cluster["id"]))
+    if cluster.get("marker_entry_id"):
+        cursor.execute("UPDATE entries SET x=%s, y=%s, z=%s WHERE id=%s", (cluster["center_x"], cluster["center_y"], cluster["center_z"], cluster["marker_entry_id"]))
+
+
+def save_navigator_gps(incoming):
+    """Persist a map submission using the Navigator's shared GPS rules."""
+    global ACTIVE_CONFIG, ENTRY_COLUMNS
+    if ACTIVE_CONFIG is None:
+        ACTIVE_CONFIG = db_config()
+    gps = parse_se_gps(incoming.get("gps"))
+    location_type = str(incoming.get("location_type") or "asteroid").strip().lower()
+    if location_type not in {"asteroid", "station", "planet", "base", "unknown", "other"}:
+        raise ValueError("Choose a valid GPS type")
+    description = str(incoming.get("description") or gps["description"] or "").strip()
+    if len(description.encode("utf-8")) > 65_535:
+        raise ValueError("Description is too long")
+    ore_type = "STATION" if location_type == "station" else detected_ore(gps["name"] + " " + description)
+    if len(gps["name"]) > 128:
+        raise ValueError("GPS name is too long")
+
+    with pymysql.connect(**ACTIVE_CONFIG, autocommit=False, cursorclass=pymysql.cursors.DictCursor) as conn:
+        try:
+            with conn.cursor() as cur:
+                ensure_navigator_schema(cur)
+                ENTRY_COLUMNS = None
+                # Lock a matching resource first: Navigator combines reports within 1.5 km.
+                cur.execute(
+                    "SELECT id, name, x, y, z, ore_type, description, cluster_id, report_count, location_type FROM entries "
+                    "WHERE UPPER(ore_type)=UPPER(%s) AND x BETWEEN %s AND %s AND y BETWEEN %s AND %s AND z BETWEEN %s AND %s "
+                    "ORDER BY POW(x-%s,2)+POW(y-%s,2)+POW(z-%s,2) LIMIT 1 FOR UPDATE",
+                    (ore_type, gps["x"] - DEDUP_RADIUS, gps["x"] + DEDUP_RADIUS, gps["y"] - DEDUP_RADIUS, gps["y"] + DEDUP_RADIUS, gps["z"] - DEDUP_RADIUS, gps["z"] + DEDUP_RADIUS, gps["x"], gps["y"], gps["z"]),
+                )
+                existing = cur.fetchone()
+                if existing and distance_3d(gps, existing) <= DEDUP_RADIUS:
+                    reports = int(existing.get("report_count") or 1)
+                    merged = {axis: (existing[axis] * reports + gps[axis]) / (reports + 1) for axis in ("x", "y", "z")}
+                    merged_description = existing.get("description") or ""
+                    if description and description not in merged_description:
+                        merged_description = f"{merged_description}; {description}".strip("; ")
+                    cur.execute("UPDATE entries SET x=%s, y=%s, z=%s, report_count=%s, description=%s WHERE id=%s", (merged["x"], merged["y"], merged["z"], reports + 1, merged_description, existing["id"]))
+                    if existing.get("cluster_id"):
+                        cur.execute("SELECT id, name, marker_entry_id FROM clusters WHERE id=%s FOR UPDATE", (existing["cluster_id"],))
+                        cluster = cur.fetchone()
+                        if cluster:
+                            cur.execute("UPDATE cluster_points SET x=%s, y=%s, z=%s WHERE cluster_id=%s AND x=%s AND y=%s AND z=%s LIMIT 1", (merged["x"], merged["y"], merged["z"], cluster["id"], existing["x"], existing["y"], existing["z"]))
+                            refresh_cluster_center(cur, cluster)
+                    conn.commit()
+                    return {"id": existing["id"], "merged": True, "report_count": reports + 1}
+
+                cur.execute("SELECT id, name, center_x, center_y, center_z, marker_entry_id FROM clusters FOR UPDATE")
+                clusters = list(cur.fetchall())
+                cluster = cluster_name_in_text(clusters, gps["name"])
+                matched_by_name = cluster is not None
+                if cluster is None:
+                    nearby = [(distance_3d(gps, {"x": row["center_x"], "y": row["center_y"], "z": row["center_z"]}), row) for row in clusters]
+                    within_range = [item for item in nearby if item[0] <= CLUSTER_RADIUS]
+                    cluster = min(within_range, key=lambda item: item[0])[1] if within_range else None
+                if cluster is None:
+                    cur.execute("SELECT GET_LOCK(%s, 10) AS acquired", ("se_gps_navigator_cluster_creation",))
+                    if not cur.fetchone()["acquired"]:
+                        raise RuntimeError("Could not reserve cluster creation. Try again in a moment.")
+                    cur.execute("SELECT id, name, center_x, center_y, center_z, marker_entry_id FROM clusters FOR UPDATE")
+                    clusters = list(cur.fetchall())
+                    nearby = [(distance_3d(gps, {"x": row["center_x"], "y": row["center_y"], "z": row["center_z"]}), row) for row in clusters]
+                    within_range = [item for item in nearby if item[0] <= CLUSTER_RADIUS]
+                    if within_range:
+                        cluster = min(within_range, key=lambda item: item[0])[1]
+                    else:
+                        cur.execute("SELECT name FROM entries")
+                        existing_names = {row["name"] for row in cur.fetchall()} | {row["name"] for row in clusters}
+                        name = generate_cluster_name(clusters, existing_names, gps)
+                        cur.execute("INSERT INTO clusters (name, center_x, center_y, center_z) VALUES (%s,%s,%s,%s)", (name, gps["x"], gps["y"], gps["z"]))
+                        cluster = {"id": cur.lastrowid, "name": name, "center_x": gps["x"], "center_y": gps["y"], "center_z": gps["z"], "marker_entry_id": None}
+                        cur.execute("INSERT INTO cluster_points (cluster_id, x, y, z) VALUES (%s,%s,%s,%s)", (cluster["id"], gps["x"], gps["y"], gps["z"]))
+                        create_cluster_marker(cur, cluster)
+                if cluster.get("marker_entry_id") is None:
+                    create_cluster_marker(cur, cluster)
+                if not matched_by_name or cluster["id"] not in {row["id"] for row in clusters}:
+                    # A new cluster already has its first point; existing clusters need this point recorded.
+                    if cluster["id"] in {row["id"] for row in clusters}:
+                        cur.execute("INSERT INTO cluster_points (cluster_id, x, y, z) VALUES (%s,%s,%s,%s)", (cluster["id"], gps["x"], gps["y"], gps["z"]))
+                        refresh_cluster_center(cur, cluster)
+                else:
+                    cur.execute("INSERT INTO cluster_points (cluster_id, x, y, z) VALUES (%s,%s,%s,%s)", (cluster["id"], gps["x"], gps["y"], gps["z"]))
+                    refresh_cluster_center(cur, cluster)
+                entry_name = gps["name"] if matched_by_name else f"{cluster['name']} {ore_type}"
+                cur.execute("INSERT INTO entries (name, x, y, z, ore_type, description, added_at, cluster_id, location_type) VALUES (%s,%s,%s,%s,%s,%s,NOW(),%s,%s)", (entry_name, gps["x"], gps["y"], gps["z"], ore_type, description, cluster["id"], location_type.title()))
+                entry_id = cur.lastrowid
+            conn.commit()
+            return {"id": entry_id, "merged": False, "cluster": cluster["name"]}
+        finally:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT RELEASE_LOCK(%s)", ("se_gps_navigator_cluster_creation",))
+            except Exception:
+                pass
+
+
 def database_revision(user):
     """Return a compact signature of map data visible to this access level."""
     global ACTIVE_CONFIG
@@ -419,9 +657,9 @@ def load_data(user):
             entries = list(cur.fetchall())
             cur.execute("SELECT id, name, center_x, center_y, center_z FROM clusters ORDER BY id")
             clusters = list(cur.fetchall())
-    visibility = saved_visibility()
     cluster_by_id = {cluster["id"]: cluster for cluster in clusters}
     cluster_regions = region_keys(clusters)
+    visibility = saved_visibility()
     user_rank = access_rank(user["role"])
     visible_entries = []
     for entry in entries:
@@ -610,6 +848,15 @@ class Handler(SimpleHTTPRequestHandler):
                 visibility = save_visibility(actor, str(incoming.get("entity_type", "")), incoming.get("entity_key"), incoming.get("visibility"))
                 self.send_json({"ok": True, "visibility": visibility})
                 return
+            if path == "/api/gps":
+                actor = self.require_user({"trusted", "council", "leader", "admin"})
+                if not actor:
+                    return
+                saved = save_navigator_gps(incoming)
+                if "visibility" in incoming:
+                    save_visibility(actor, "gps", saved["id"], incoming["visibility"])
+                self.send_json({"ok": True, **saved}, 201)
+                return
             if path == "/api/update":
                 actor = self.require_user({"trusted", "council", "leader", "admin"})
                 if not actor:
@@ -720,4 +967,5 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"Spatial Atlas bridge: http://127.0.0.1:{PORT}")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    print(f"Listening on {HOST}:{PORT} (Atlas sign-in required)")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
